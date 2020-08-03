@@ -277,7 +277,7 @@ BEGIN
 SET NOCOUNT ON;
 SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
 
-SELECT @Version = '7.96', @VersionDate = '20200606';
+SELECT @Version = '7.97', @VersionDate = '20200712';
 
 
 IF(@VersionCheckMode = 1)
@@ -752,6 +752,9 @@ BEGIN
 	RETURN;
 END;
 
+/* Lets get @SortOrder set to lower case here for comparisons later */
+SET @SortOrder = LOWER(@SortOrder);
+
 /* If they want to sort by query hash, populate the @OnlyQueryHashes list for them */
 IF @SortOrder LIKE 'query hash%'
 	BEGIN
@@ -1088,7 +1091,6 @@ END;
 
 SELECT @MinMemoryPerQuery = CONVERT(INT, c.value) FROM sys.configurations AS c WHERE c.name = 'min memory per query (KB)';
 
-SET @SortOrder = LOWER(@SortOrder);
 SET @SortOrder = REPLACE(REPLACE(@SortOrder, 'average', 'avg'), '.', '');
 
 SET @SortOrder = CASE 
@@ -1564,9 +1566,9 @@ SELECT SUM(CASE WHEN DATEDIFF(HOUR, deqs.creation_time, SYSDATETIME()) <= 24 THE
 FROM sys.dm_exec_query_stats AS deqs
 )
 INSERT INTO #plan_creation ( percent_24, percent_4, percent_1, total_plans, SPID )
-SELECT CONVERT(DECIMAL(3,2), NULLIF(x.plans_24, 0) / (1. * NULLIF(x.total_plans, 0))) * 100 AS [percent_24],
-	   CONVERT(DECIMAL(3,2), NULLIF(x.plans_4 , 0) / (1. * NULLIF(x.total_plans, 0))) * 100 AS [percent_4],
-	   CONVERT(DECIMAL(3,2), NULLIF(x.plans_1 , 0) / (1. * NULLIF(x.total_plans, 0))) * 100 AS [percent_1],
+SELECT CONVERT(DECIMAL(5,2), NULLIF(x.plans_24, 0) / (1. * NULLIF(x.total_plans, 0))) * 100 AS [percent_24],
+	   CONVERT(DECIMAL(5,2), NULLIF(x.plans_4 , 0) / (1. * NULLIF(x.total_plans, 0))) * 100 AS [percent_4],
+	   CONVERT(DECIMAL(5,2), NULLIF(x.plans_1 , 0) / (1. * NULLIF(x.total_plans, 0))) * 100 AS [percent_1],
 	   x.total_plans,
 	   @@SPID AS SPID
 FROM x
@@ -1577,7 +1579,8 @@ RAISERROR(N'Checking for single use plans and plans with many queries', 0, 1) WI
 WITH total_plans AS 
 (
     SELECT COUNT_BIG(*) AS total_plans
-    FROM sys.dm_exec_query_stats AS deqs
+    FROM sys.dm_exec_cached_plans AS deqs
+    WHERE deqs.cacheobjtype = N'Compiled Plan'
 ),
      many_plans AS 
 (
@@ -1605,9 +1608,9 @@ WITH total_plans AS
 )
 INSERT #plan_usage ( duplicate_plan_handles, percent_duplicate, single_use_plan_count, percent_single, total_plans, spid )
 SELECT m.duplicate_plan_handles, 
-       CONVERT(DECIMAL(3,2), m.duplicate_plan_handles / (1. * NULLIF(t.total_plans, 0))) * 100. AS percent_duplicate,
+       CONVERT(DECIMAL(5,2), m.duplicate_plan_handles / (1. * NULLIF(t.total_plans, 0))) * 100. AS percent_duplicate,
        s.single_use_plan_count, 
-       CONVERT(DECIMAL(3,2), s.single_use_plan_count / (1. * NULLIF(t.total_plans, 0))) * 100. AS percent_single,
+       CONVERT(DECIMAL(5,2), s.single_use_plan_count / (1. * NULLIF(t.total_plans, 0))) * 100. AS percent_single,
        t.total_plans,
 	   @@SPID
 FROM   many_plans AS m, 
@@ -5133,8 +5136,8 @@ EXEC sys.sp_executesql @user_perm_sql,
 IF @common_version >= 11
 BEGIN
     SET @user_perm_sql = N'
-    	SELECT @user_perm_gb = CASE WHEN (pages_kb / 128.0 / 1024.) >= 2.
-    			                    THEN CONVERT(DECIMAL(38, 2), (pages_kb / 128.0 / 1024.))
+    	SELECT @user_perm_gb = CASE WHEN (pages_kb / 1024.0 / 1024.) >= 2.
+    			                    THEN CONVERT(DECIMAL(38, 2), (pages_kb / 1024.0 / 1024.))
     			                    ELSE 0 
     		                   END
     	FROM sys.dm_os_memory_clerks

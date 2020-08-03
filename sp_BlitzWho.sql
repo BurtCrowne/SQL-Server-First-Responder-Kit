@@ -28,7 +28,7 @@ BEGIN
 	SET NOCOUNT ON;
 	SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
 	
-	SELECT @Version = '7.96', @VersionDate = '20200606';
+	SELECT @Version = '7.97', @VersionDate = '20200712';
     
 	IF(@VersionCheckMode = 1)
 	BEGIN
@@ -80,6 +80,7 @@ SOFTWARE.
 DECLARE  @ProductVersion NVARCHAR(128)
 		,@ProductVersionMajor DECIMAL(10,2)
 		,@ProductVersionMinor DECIMAL(10,2)
+		,@Platform NVARCHAR(8) /* Azure or NonAzure are acceptable */ = (SELECT CASE WHEN @@VERSION LIKE '%Azure%' THEN N'Azure' ELSE N'NonAzure' END AS [Platform])
 		,@EnhanceFlag BIT = 0
 		,@BlockingCheck NVARCHAR(MAX)
 		,@StringToSelect NVARCHAR(MAX)
@@ -324,14 +325,20 @@ BEGIN
 			       derp.query_plan ,
 						    qmg.query_cost ,										   		   
 						    s.status ,
-			       COALESCE(wt.wait_info, RTRIM(blocked.lastwaittype) + '' ('' + CONVERT(VARCHAR(10), 
-						    blocked.waittime) + '')'' ) AS wait_info ,											
+							CASE
+								WHEN s.status <> ''sleeping'' THEN COALESCE(wt.wait_info, RTRIM(blocked.lastwaittype) + '' ('' + CONVERT(VARCHAR(10), blocked.waittime) + '')'' ) 
+								ELSE NULL
+							END AS wait_info ,																					
 						    CASE WHEN r.blocking_session_id <> 0 AND blocked.session_id IS NULL 
-							     THEN r.blocking_session_id
-							     WHEN r.blocking_session_id <> 0 AND s.session_id <> blocked.blocking_session_id 
-							     THEN blocked.blocking_session_id
-							    ELSE NULL 
-						    END AS blocking_session_id , 
+							       THEN r.blocking_session_id
+							       WHEN r.blocking_session_id <> 0 AND s.session_id <> blocked.blocking_session_id 
+							       THEN blocked.blocking_session_id
+								   WHEN r.blocking_session_id = 0 AND s.session_id = blocked.session_id 
+								   THEN blocked.blocking_session_id
+								   WHEN r.blocking_session_id <> 0 AND s.session_id = blocked.blocking_session_id 
+							       THEN r.blocking_session_id
+							       ELSE NULL 
+						      END AS blocking_session_id,
 			       COALESCE(r.open_transaction_count, blocked.open_tran) AS open_transaction_count ,
 						    CASE WHEN EXISTS (  SELECT 1 
                FROM sys.dm_tran_active_transactions AS tat
@@ -345,12 +352,19 @@ BEGIN
 					     s.nt_domain ,
 			       s.host_name ,
 			       s.login_name ,
-			       s.nt_user_name ,
-			       program_name = COALESCE((
-SELECT REPLACE(program_name,Substring(program_name,30,34),''"''+j.name+''"'') 
-FROM msdb.dbo.sysjobs j WHERE Substring(program_name,32,32) = CONVERT(char(32),CAST(j.job_id AS binary(16)),2)
-),s.program_name)
-						    '
+			       s.nt_user_name ,'
+		IF @Platform = 'NonAzure'
+		BEGIN
+		SET @StringToExecute +=
+				   N'program_name = COALESCE((
+					SELECT REPLACE(program_name,Substring(program_name,30,34),''"''+j.name+''"'') 
+					FROM msdb.dbo.sysjobs j WHERE Substring(program_name,32,32) = CONVERT(char(32),CAST(j.job_id AS binary(16)),2)
+					),s.program_name)'
+		END
+		ELSE
+		BEGIN
+		SET @StringToExecute += N's.program_name'
+		END
 						
     IF @ExpertMode = 1
     BEGIN
@@ -518,7 +532,10 @@ IF @ProductVersionMajor >= 11
 						    +' 
 			       qmg.query_cost ,
 			       s.status ,
-			       COALESCE(wt.wait_info, RTRIM(blocked.lastwaittype) + '' ('' + CONVERT(VARCHAR(10), blocked.waittime) + '')'' ) AS wait_info ,'
+					CASE
+						WHEN s.status <> ''sleeping'' THEN COALESCE(wt.wait_info, RTRIM(blocked.lastwaittype) + '' ('' + CONVERT(VARCHAR(10), blocked.waittime) + '')'' ) 
+						ELSE NULL
+					END AS wait_info ,'
 						    +
 						    CASE @SessionWaits
 							     WHEN 1 THEN + N'SUBSTRING(wt2.session_wait_info, 0, LEN(wt2.session_wait_info) ) AS top_session_waits ,'
@@ -529,6 +546,10 @@ IF @ProductVersionMajor >= 11
 							       THEN r.blocking_session_id
 							       WHEN r.blocking_session_id <> 0 AND s.session_id <> blocked.blocking_session_id 
 							       THEN blocked.blocking_session_id
+								   WHEN r.blocking_session_id = 0 AND s.session_id = blocked.session_id 
+								   THEN blocked.blocking_session_id
+								   WHEN r.blocking_session_id <> 0 AND s.session_id = blocked.blocking_session_id 
+							       THEN r.blocking_session_id
 							       ELSE NULL 
 						      END AS blocking_session_id,
 			       COALESCE(r.open_transaction_count, blocked.open_tran) AS open_transaction_count ,
@@ -544,12 +565,20 @@ IF @ProductVersionMajor >= 11
 					     s.nt_domain ,
 			       s.host_name ,
 			       s.login_name ,
-			       s.nt_user_name ,
-			       program_name = COALESCE((
-SELECT REPLACE(program_name,Substring(program_name,30,34),''"''+j.name+''"'') 
-FROM msdb.dbo.sysjobs j WHERE Substring(program_name,32,32) = CONVERT(char(32),CAST(j.job_id AS binary(16)),2)
-),s.program_name) 
-						    '	   
+			       s.nt_user_name ,'
+		IF @Platform = 'NonAzure'
+		BEGIN
+		SET @StringToExecute +=
+				   N'program_name = COALESCE((
+					SELECT REPLACE(program_name,Substring(program_name,30,34),''"''+j.name+''"'') 
+					FROM msdb.dbo.sysjobs j WHERE Substring(program_name,32,32) = CONVERT(char(32),CAST(j.job_id AS binary(16)),2)
+					),s.program_name)'
+		END
+		ELSE
+		BEGIN
+		SET @StringToExecute += N's.program_name'
+		END
+
     IF @ExpertMode = 1 /* We show more columns in expert mode, so the SELECT gets longer */
     BEGIN
         SET @StringToExecute += 						

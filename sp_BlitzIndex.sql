@@ -32,6 +32,7 @@ ALTER PROCEDURE dbo.sp_BlitzIndex
     @OutputSchemaName NVARCHAR(256) = NULL ,
     @OutputTableName NVARCHAR(256) = NULL ,
 	@IncludeInactiveIndexes BIT = 0 /* Will skip indexes with no reads or writes */,
+    @ShowAllMissingIndexRequests BIT = 0 /*Will make all missing index requests show up*/,
     @Help TINYINT = 0,
 	@Debug BIT = 0,
     @Version     VARCHAR(30) = NULL OUTPUT,
@@ -42,7 +43,7 @@ AS
 SET NOCOUNT ON;
 SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
 
-SELECT @Version = '7.96', @VersionDate = '20200606';
+SELECT @Version = '7.97', @VersionDate = '20200712';
 SET @OutputType  = UPPER(@OutputType);
 
 IF(@VersionCheckMode = 1)
@@ -258,6 +259,7 @@ IF OBJECT_ID('tempdb..#Ignore_Databases') IS NOT NULL
               is_spatial BIT NOT NULL,
               is_NC_columnstore BIT NOT NULL,
               is_CX_columnstore BIT NOT NULL,
+              is_in_memory_oltp BIT NOT NULL ,
               is_disabled BIT NOT NULL ,
               is_hypothetical BIT NOT NULL ,
               is_padded BIT NOT NULL ,
@@ -298,6 +300,7 @@ IF OBJECT_ID('tempdb..#Ignore_Databases') IS NOT NULL
                     ELSE N'' END + CASE WHEN is_XML = 1 THEN N'[XML] '
                     ELSE N'' END + CASE WHEN is_spatial = 1 THEN N'[SPATIAL] '
                     ELSE N'' END + CASE WHEN is_NC_columnstore = 1 THEN N'[COLUMNSTORE] '
+                    ELSE N'' END + CASE WHEN is_in_memory_oltp = 1 THEN N'[IN-MEMORY] '
                     ELSE N'' END + CASE WHEN is_disabled = 1 THEN N'[DISABLED] '
                     ELSE N'' END + CASE WHEN is_hypothetical = 1 THEN N'[HYPOTHETICAL] '
                     ELSE N'' END + CASE WHEN is_unique = 1 AND is_primary_key = 0 THEN N'[UNIQUE] '
@@ -328,8 +331,12 @@ IF OBJECT_ID('tempdb..#Ignore_Databases') IS NOT NULL
                     ELSE N' ' END 
                 + N'Writes:' + 
                 REPLACE(CONVERT(NVARCHAR(30),CAST(user_updates AS MONEY), 1), N'.00', N''),
-            [more_info] AS N'EXEC dbo.sp_BlitzIndex @DatabaseName=' + QUOTENAME([database_name],N'''') + 
-                N', @SchemaName=' + QUOTENAME([schema_name],N'''') + N', @TableName=' + QUOTENAME([object_name],N'''') + N';'
+            [more_info] AS 
+                CASE WHEN is_in_memory_oltp = 1 
+                    THEN N'EXEC dbo.sp_BlitzInMemoryOLTP @dbName=' + QUOTENAME([database_name],N'''') + 
+                    N', @tableName=' + QUOTENAME([object_name],N'''') + N';'
+                ELSE N'EXEC dbo.sp_BlitzIndex @DatabaseName=' + QUOTENAME([database_name],N'''') + 
+                    N', @SchemaName=' + QUOTENAME([schema_name],N'''') + N', @TableName=' + QUOTENAME([object_name],N'''') + N';' END
 		);
         RAISERROR (N'Adding UQ index on #IndexSanity (database_id, object_id, index_id)',0,1) WITH NOWAIT;
         IF NOT EXISTS(SELECT 1 FROM tempdb.sys.indexes WHERE name='uq_database_id_object_id_index_id') 
@@ -528,9 +535,12 @@ IF OBJECT_ID('tempdb..#Ignore_Databases') IS NOT NULL
             user_seeks BIGINT NOT NULL,
             user_scans BIGINT NOT NULL,
             unique_compiles BIGINT NULL,
-            equality_columns NVARCHAR(4000), 
+            equality_columns NVARCHAR(4000),
+            equality_columns_with_data_type NVARCHAR(4000),
             inequality_columns NVARCHAR(4000),
+            inequality_columns_with_data_type NVARCHAR(4000),
             included_columns NVARCHAR(4000),
+            included_columns_with_data_type NVARCHAR(4000),
 			is_low BIT,
                 [index_estimated_impact] AS 
                     REPLACE(CONVERT(NVARCHAR(256),CAST(CAST(
@@ -541,13 +551,17 @@ IF OBJECT_ID('tempdb..#Ignore_Databases') IS NOT NULL
                         + N'%; Avg query cost: '
                         + CAST(avg_total_user_cost AS NVARCHAR(30)),
                 [missing_index_details] AS
-                    CASE WHEN equality_columns IS NOT NULL THEN N'EQUALITY: ' + equality_columns + N' '
-                         ELSE N''
-                    END + CASE WHEN inequality_columns IS NOT NULL THEN N'INEQUALITY: ' + inequality_columns + N' '
-                       ELSE N''
-                    END + CASE WHEN included_columns IS NOT NULL THEN N'INCLUDES: ' + included_columns + N' '
-                        ELSE N''
-                    END,
+                    CASE WHEN COALESCE(equality_columns_with_data_type,equality_columns) IS NOT NULL
+						THEN N'EQUALITY: ' + COALESCE(equality_columns_with_data_type,equality_columns) + N' '
+                         ELSE N'' END +
+
+                    CASE WHEN COALESCE(inequality_columns_with_data_type,inequality_columns) IS NOT NULL
+						THEN N'INEQUALITY: ' + COALESCE(inequality_columns_with_data_type,inequality_columns) + N' '
+                         ELSE N'' END +
+
+                    CASE WHEN COALESCE(included_columns_with_data_type,included_columns) IS NOT NULL
+						THEN N'INCLUDE: ' + COALESCE(included_columns_with_data_type,included_columns) + N' '
+                         ELSE N'' END,
                 [create_tsql] AS N'CREATE INDEX [' 
                     + REPLACE(REPLACE(REPLACE(REPLACE(
                         ISNULL(equality_columns,N'')+ 
@@ -1051,7 +1065,9 @@ BEGIN TRY
 
         --insert columns for clustered indexes and heaps
         --collect info on identity columns for this one
-        SET @dsql = N'SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
+        SET @dsql = N'/* sp_BlitzIndex */
+				SET LOCK_TIMEOUT 1000; /* To fix locking bug in sys.identity_columns. See Github issue #2176. */
+				SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
                 SELECT ' + CAST(@DatabaseID AS NVARCHAR(16)) + ',
 					s.name,    
                     si.object_id, 
@@ -1115,10 +1131,30 @@ BEGIN TRY
                 PRINT SUBSTRING(@dsql, 32000, 36000);
                 PRINT SUBSTRING(@dsql, 36000, 40000);
             END;
-        INSERT    #IndexColumns ( database_id, [schema_name], [object_id], index_id, key_ordinal, is_included_column, is_descending_key, partition_ordinal,
-            column_name, system_type_name, max_length, precision, scale, collation_name, is_nullable, is_identity, is_computed,
-            is_replicated, is_sparse, is_filestream, seed_value, increment_value, last_value, is_not_for_replication )
-                EXEC sp_executesql @dsql;
+		BEGIN TRY
+			INSERT    #IndexColumns ( database_id, [schema_name], [object_id], index_id, key_ordinal, is_included_column, is_descending_key, partition_ordinal,
+				column_name, system_type_name, max_length, precision, scale, collation_name, is_nullable, is_identity, is_computed,
+				is_replicated, is_sparse, is_filestream, seed_value, increment_value, last_value, is_not_for_replication )
+					EXEC sp_executesql @dsql;
+		END TRY
+		BEGIN CATCH
+			RAISERROR (N'Failure inserting data into #IndexColumns for clustered indexes and heaps.', 0,1) WITH NOWAIT;
+
+			IF @dsql IS NOT NULL
+			BEGIN
+				SET @msg= 'Last @dsql: ' + @dsql;
+				RAISERROR(@msg, 0, 1) WITH NOWAIT;
+			END;
+
+			SELECT  @msg = @DatabaseName + N' database failed to process. ' + ERROR_MESSAGE(),
+				@ErrorSeverity = 0, @ErrorState = ERROR_STATE();
+			RAISERROR (@msg,@ErrorSeverity, @ErrorState )WITH NOWAIT;
+
+			WHILE @@trancount > 0 
+				ROLLBACK;
+
+			RETURN;
+		END CATCH;
 
 
         --insert columns for nonclustered indexes
@@ -1202,6 +1238,7 @@ BEGIN TRY
                         CASE when si.type = 4 THEN 1 ELSE 0 END AS is_spatial,
                         CASE when si.type = 6 THEN 1 ELSE 0 END AS is_NC_columnstore,
                         CASE when si.type = 5 then 1 else 0 end as is_CX_columnstore,
+                        CASE when si.data_space_id = 0 then 1 else 0 end as is_in_memory_oltp,
                         si.is_disabled,
                         si.is_hypothetical, 
                         si.is_padded, 
@@ -1257,7 +1294,7 @@ BEGIN TRY
                 PRINT SUBSTRING(@dsql, 36000, 40000);
             END;
         INSERT    #IndexSanity ( [database_id], [object_id], [index_id], [index_type], [database_name], [schema_name], [object_name],
-                                index_name, is_indexed_view, is_unique, is_primary_key, is_XML, is_spatial, is_NC_columnstore, is_CX_columnstore,
+                                index_name, is_indexed_view, is_unique, is_primary_key, is_XML, is_spatial, is_NC_columnstore, is_CX_columnstore, is_in_memory_oltp,
                                 is_disabled, is_hypothetical, is_padded, fill_factor, filter_definition, user_seeks, user_scans, 
                                 user_lookups, user_updates, last_user_seek, last_user_scan, last_user_lookup, last_user_update,
                                 create_date, modify_date )
@@ -1474,10 +1511,73 @@ BEGIN TRY
 
 
         RAISERROR (N'Inserting data into #MissingIndexes',0,1) WITH NOWAIT;
-        SET @dsql=N'SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
+        SET @dsql=N'SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;'
+
+
+		SET @dsql = @dsql + 'WITH ColumnNamesWithDataTypes AS(SELECT id.index_handle,id.object_id,cn.IndexColumnType,STUFF((SELECT cn_inner.ColumnName + '' '' +
+					N'' {'' + CASE	 WHEN ty.name IN ( ''varchar'', ''char'' ) THEN ty.name + ''('' + IIF(co.max_length = -1, ''max'', CAST(co.max_length AS VARCHAR(25))) + '')''
+								WHEN ty.name IN ( ''nvarchar'', ''nchar'' ) THEN ty.name + ''('' + IIF(co.max_length = -1, ''max'', CAST(co.max_length / 2 AS VARCHAR(25))) + '')''
+								WHEN ty.name IN ( ''decimal'', ''numeric'' ) THEN ty.name + ''('' + CAST(co.precision AS VARCHAR(25)) + '', '' + CAST(co.scale AS VARCHAR(25)) + '')''
+								WHEN ty.name IN ( ''datetime2'' ) THEN ty.name + ''('' + CAST(co.scale AS VARCHAR(25)) + '')''
+								ELSE ty.name END + ''} ''
+				FROM	sys.dm_db_missing_index_details AS id_inner
+				CROSS APPLY(
+					SELECT	LTRIM(RTRIM(v.value(''(./text())[1]'', ''varchar(max)''))) AS ColumnName, ''Equality'' AS IndexColumnType
+					FROM	(VALUES (CONVERT(XML, ''<x>'' + REPLACE(id_inner.equality_columns, '','', ''</x><x>'')+''</x>''))) x(n)
+					CROSS APPLY n.nodes(''x'') node(v)
+				UNION ALL
+					SELECT	LTRIM(RTRIM(v.value(''(./text())[1]'', ''varchar(max)''))) AS ColumnName, ''Inequality'' AS IndexColumnType
+					FROM	(VALUES (CONVERT(XML, ''<x>'' + REPLACE(id_inner.inequality_columns, '','', ''</x><x>'')+''</x>''))) x(n)
+					CROSS APPLY n.nodes(''x'') node(v)
+				UNION ALL
+					SELECT	LTRIM(RTRIM(v.value(''(./text())[1]'', ''varchar(max)''))) AS ColumnName, ''Included'' AS IndexColumnType
+					FROM	(VALUES (CONVERT(XML, ''<x>'' + REPLACE(id_inner.included_columns, '','', ''</x><x>'')+''</x>''))) x(n)
+					CROSS APPLY n.nodes(''x'') node(v)
+			)AS cn_inner'
+		+ /*split the string otherwise dsql cuts some of it out*/
+		'		JOIN	' + QUOTENAME(@DatabaseName) + N'.sys.columns AS co ON co.object_id = id_inner.object_id AND ''['' + co.name + '']'' = cn_inner.ColumnName
+				JOIN	' + QUOTENAME(@DatabaseName) + N'.sys.types AS ty ON ty.user_type_id = co.user_type_id 
+                WHERE id_inner.index_handle = id.index_handle
+				AND	id_inner.object_id = id.object_id
+				AND cn_inner.IndexColumnType = cn.IndexColumnType
+				FOR XML PATH('''')
+			 ),1,0,'''') AS ReplaceColumnNames
+            FROM sys.dm_db_missing_index_details AS id
+           CROSS APPLY(
+						SELECT	LTRIM(RTRIM(v.value(''(./text())[1]'', ''varchar(max)''))) AS ColumnName, ''Equality'' AS IndexColumnType
+						FROM	(VALUES (CONVERT(XML, ''<x>'' + REPLACE(id.equality_columns, '','', ''</x><x>'')+''</x>''))) x(n)
+						CROSS APPLY n.nodes(''x'') node(v)
+				    UNION ALL
+						SELECT	LTRIM(RTRIM(v.value(''(./text())[1]'', ''varchar(max)''))) AS ColumnName, ''Inequality'' AS IndexColumnType
+						FROM	(VALUES (CONVERT(XML, ''<x>'' + REPLACE(id.inequality_columns, '','', ''</x><x>'')+''</x>''))) x(n)
+						CROSS APPLY n.nodes(''x'') node(v)
+				    UNION ALL
+						SELECT	LTRIM(RTRIM(v.value(''(./text())[1]'', ''varchar(max)''))) AS ColumnName, ''Included'' AS IndexColumnType
+						FROM	(VALUES (CONVERT(XML, ''<x>'' + REPLACE(id.included_columns, '','', ''</x><x>'')+''</x>''))) x(n)
+						CROSS APPLY n.nodes(''x'') node(v)
+					)AS cn
+				GROUP BY	id.index_handle,id.object_id,cn.IndexColumnType
+				)
                 SELECT  id.database_id, id.object_id, @i_DatabaseName, sc.[name], so.[name], id.statement , gs.avg_total_user_cost, 
-                        gs.avg_user_impact, gs.user_seeks, gs.user_scans, gs.unique_compiles,id.equality_columns, 
-                        id.inequality_columns,id.included_columns
+                        gs.avg_user_impact, gs.user_seeks, gs.user_scans, gs.unique_compiles, id.equality_columns, id.inequality_columns, id.included_columns,
+				(
+                    SELECT ColumnNamesWithDataTypes.ReplaceColumnNames 
+                    FROM ColumnNamesWithDataTypes WHERE ColumnNamesWithDataTypes.index_handle = id.index_handle
+                    AND ColumnNamesWithDataTypes.object_id = id.object_id
+                    AND ColumnNamesWithDataTypes.IndexColumnType = ''Equality''
+                ) AS equality_columns_with_data_type
+                ,(
+                    SELECT ColumnNamesWithDataTypes.ReplaceColumnNames 
+                    FROM ColumnNamesWithDataTypes WHERE ColumnNamesWithDataTypes.index_handle = id.index_handle
+                    AND ColumnNamesWithDataTypes.object_id = id.object_id
+                    AND ColumnNamesWithDataTypes.IndexColumnType = ''Inequality''
+                ) AS inequality_columns_with_data_type
+                ,(
+                    SELECT ColumnNamesWithDataTypes.ReplaceColumnNames 
+                    FROM ColumnNamesWithDataTypes WHERE ColumnNamesWithDataTypes.index_handle = id.index_handle
+                    AND ColumnNamesWithDataTypes.object_id = id.object_id
+                    AND ColumnNamesWithDataTypes.IndexColumnType = ''Included''
+                ) AS included_columns_with_data_type
                 FROM    sys.dm_db_missing_index_groups ig
                         JOIN sys.dm_db_missing_index_details id ON ig.index_handle = id.index_handle
                         JOIN sys.dm_db_missing_index_group_stats gs ON ig.index_group_handle = gs.group_handle
@@ -1508,7 +1608,8 @@ BEGIN TRY
             END;
         INSERT    #MissingIndexes ( [database_id], [object_id], [database_name], [schema_name], [table_name], [statement], avg_total_user_cost, 
                                     avg_user_impact, user_seeks, user_scans, unique_compiles, equality_columns, 
-                                    inequality_columns, included_columns)
+                                    inequality_columns, included_columns, equality_columns_with_data_type, inequality_columns_with_data_type, 
+                                    included_columns_with_data_type)
         EXEC sp_executesql @dsql, @params = N'@i_DatabaseName NVARCHAR(128)', @i_DatabaseName = @DatabaseName;
 
         SET @dsql = N'
@@ -2168,55 +2269,49 @@ INSERT #IndexCreateTsql (index_sanity_id, create_tsql)
 SELECT
     index_sanity_id,
     ISNULL (
-    /* Script drops for disabled non-clustered indexes*/
-    CASE WHEN is_disabled = 1 AND index_id <> 1
-         THEN N'--DROP INDEX ' + QUOTENAME([index_name]) + N' ON '
-            + QUOTENAME([schema_name]) + N'.' + QUOTENAME([object_name])
-    ELSE
-        CASE index_id WHEN 0 THEN N'ALTER TABLE ' + QUOTENAME([database_name]) + N'.' + QUOTENAME([schema_name]) + N'.' + QUOTENAME([object_name])  + ' REBUILD;'
+    CASE index_id WHEN 0 THEN N'ALTER TABLE ' + QUOTENAME([database_name]) + N'.' + QUOTENAME([schema_name]) + N'.' + QUOTENAME([object_name])  + ' REBUILD;'
+    ELSE 
+        CASE WHEN is_XML = 1 OR is_spatial = 1 OR is_in_memory_oltp = 1 THEN N'' /* Not even trying for these just yet...*/
         ELSE 
-            CASE WHEN is_XML = 1 OR is_spatial=1 THEN N'' /* Not even trying for these just yet...*/
-            ELSE 
-                CASE WHEN is_primary_key=1 THEN
-                    N'ALTER TABLE ' + QUOTENAME([database_name]) + N'.' + QUOTENAME([schema_name]) +
-                        N'.' + QUOTENAME([object_name]) + 
-                        N' ADD CONSTRAINT [' +
-                        index_name + 
-                        N'] PRIMARY KEY ' + 
-                        CASE WHEN index_id=1 THEN N'CLUSTERED (' ELSE N'(' END +
-                        key_column_names_with_sort_order_no_types + N' )' 
-                    WHEN is_CX_columnstore= 1 THEN
-                            N'CREATE CLUSTERED COLUMNSTORE INDEX ' + QUOTENAME(index_name) + N' on ' + QUOTENAME([database_name]) + N'.' + QUOTENAME([schema_name]) + N'.' + QUOTENAME([object_name])
-                ELSE /*Else not a PK or cx columnstore */ 
-                    N'CREATE ' + 
-                    CASE WHEN is_unique=1 THEN N'UNIQUE ' ELSE N'' END +
-                    CASE WHEN index_id=1 THEN N'CLUSTERED ' ELSE N'' END +
-                    CASE WHEN is_NC_columnstore=1 THEN N'NONCLUSTERED COLUMNSTORE ' 
-                    ELSE N'' END +
-                    N'INDEX ['
-                            + index_name + N'] ON ' + 
-                        QUOTENAME([database_name]) + N'.' + 
-                        QUOTENAME([schema_name]) + N'.' + QUOTENAME([object_name]) + 
-                            CASE WHEN is_NC_columnstore=1 THEN 
-                                N' (' + ISNULL(include_column_names_no_types,'') +  N' )' 
-                            ELSE /*Else not colunnstore */ 
-                                N' (' + ISNULL(key_column_names_with_sort_order_no_types,'') +  N' )' 
-                                + CASE WHEN include_column_names_no_types IS NOT NULL THEN 
-                                    N' INCLUDE (' + include_column_names_no_types + N')' 
-                                    ELSE N'' 
-                                END
-                            END /*End non-colunnstore case */ 
-                        + CASE WHEN filter_definition <> N'' THEN N' WHERE ' + filter_definition ELSE N'' END
-                    END /*End Non-PK index CASE */ 
-                + CASE WHEN is_NC_columnstore=0 AND is_CX_columnstore=0 THEN
-                    N' WITH (' 
-                        + N'FILLFACTOR=' + CASE fill_factor WHEN 0 THEN N'100' ELSE CAST(fill_factor AS NVARCHAR(5)) END + ', '
-                        + N'ONLINE=?, SORT_IN_TEMPDB=?, DATA_COMPRESSION=?'
-                    + N')'
-                ELSE N'' END
-                + N';'
-                END /*End non-spatial and non-xml CASE */ 
-        END
+            CASE WHEN is_primary_key=1 THEN
+                N'ALTER TABLE ' + QUOTENAME([database_name]) + N'.' + QUOTENAME([schema_name]) +
+                    N'.' + QUOTENAME([object_name]) + 
+                    N' ADD CONSTRAINT [' +
+                    index_name + 
+                    N'] PRIMARY KEY ' + 
+                    CASE WHEN index_id=1 THEN N'CLUSTERED (' ELSE N'(' END +
+                    key_column_names_with_sort_order_no_types + N' )' 
+                WHEN is_CX_columnstore= 1 THEN
+                        N'CREATE CLUSTERED COLUMNSTORE INDEX ' + QUOTENAME(index_name) + N' on ' + QUOTENAME([database_name]) + N'.' + QUOTENAME([schema_name]) + N'.' + QUOTENAME([object_name])
+            ELSE /*Else not a PK or cx columnstore */ 
+                N'CREATE ' + 
+                CASE WHEN is_unique=1 THEN N'UNIQUE ' ELSE N'' END +
+                CASE WHEN index_id=1 THEN N'CLUSTERED ' ELSE N'' END +
+                CASE WHEN is_NC_columnstore=1 THEN N'NONCLUSTERED COLUMNSTORE ' 
+                ELSE N'' END +
+                N'INDEX ['
+                        + index_name + N'] ON ' + 
+                    QUOTENAME([database_name]) + N'.' + 
+                    QUOTENAME([schema_name]) + N'.' + QUOTENAME([object_name]) + 
+                        CASE WHEN is_NC_columnstore=1 THEN 
+                            N' (' + ISNULL(include_column_names_no_types,'') +  N' )' 
+                        ELSE /*Else not columnstore */ 
+                            N' (' + ISNULL(key_column_names_with_sort_order_no_types,'') +  N' )' 
+                            + CASE WHEN include_column_names_no_types IS NOT NULL THEN 
+                                N' INCLUDE (' + include_column_names_no_types + N')' 
+                                ELSE N'' 
+                            END
+                        END /*End non-columnstore case */ 
+                    + CASE WHEN filter_definition <> N'' THEN N' WHERE ' + filter_definition ELSE N'' END
+                END /*End Non-PK index CASE */ 
+            + CASE WHEN is_NC_columnstore=0 AND is_CX_columnstore=0 THEN
+                N' WITH (' 
+                    + N'FILLFACTOR=' + CASE fill_factor WHEN 0 THEN N'100' ELSE CAST(fill_factor AS NVARCHAR(5)) END + ', '
+                    + N'ONLINE=?, SORT_IN_TEMPDB=?, DATA_COMPRESSION=?'
+                + N')'
+            ELSE N'' END
+            + N';'
+            END /*End non-spatial and non-xml CASE */ 
     END, '[Unknown Error]')
         AS create_tsql
 FROM #IndexSanity;
@@ -2441,8 +2536,9 @@ BEGIN
 		AND mi.database_id = cd.database_id
 		AND mi.schema_name = cd.schema_name
         WHERE   mi.[object_id] = @ObjectID
+        AND (@ShowAllMissingIndexRequests=1
                 /* Minimum benefit threshold = 100k/day of uptime OR since table creation date, whichever is lower*/
-        AND (magic_benefit_number / CASE WHEN cd.create_days < @DaysUptime THEN cd.create_days ELSE @DaysUptime END) >= 100000
+            OR (magic_benefit_number / CASE WHEN cd.create_days < @DaysUptime THEN cd.create_days ELSE @DaysUptime END) >= 100000)
         ORDER BY magic_benefit_number DESC
         OPTION    ( RECOMPILE );
     END;       
@@ -3724,7 +3820,8 @@ BEGIN;
 										  AND mi.database_id = sz.database_id
 										  AND mi.schema_name = sz.schema_name
                                         /* Minimum benefit threshold = 100k/day of uptime OR since table creation date, whichever is lower*/
-                        WHERE ( @Mode = 4 AND (magic_benefit_number / CASE WHEN sz.create_days < @DaysUptime THEN sz.create_days ELSE @DaysUptime END) >= 100000 ) 
+                        WHERE @ShowAllMissingIndexRequests=1
+                        OR ( @Mode = 4 AND (magic_benefit_number / CASE WHEN sz.create_days < @DaysUptime THEN sz.create_days ELSE @DaysUptime END) >= 100000 ) 
 						OR (magic_benefit_number / CASE WHEN sz.create_days < @DaysUptime THEN sz.create_days ELSE @DaysUptime END) >= 100000
                         ) AS t
                         WHERE t.rownum <= CASE WHEN (@Mode <> 4) THEN 20 ELSE t.rownum END
@@ -4162,6 +4259,27 @@ BEGIN;
                     WHERE i.index_type IN (5,6)
                     OPTION    ( RECOMPILE );
 				END;
+
+            RAISERROR(N'check_id 73: In-Memory OLTP', 0,1) WITH NOWAIT;
+                INSERT    #BlitzIndexResults ( check_id, index_sanity_id, Priority, findings_group, finding, [database_name], URL, details, index_definition,
+                                               secret_columns, index_usage_summary, index_size_summary )
+                    SELECT  73 AS check_id, 
+                            i.index_sanity_id,
+                            150 AS Priority,
+                            N'Abnormal Psychology' AS findings_group,
+                            N'In-Memory OLTP' AS finding,
+                            [database_name] AS [Database Name], 
+                            N'http://BrentOzar.com/go/AbnormalPsychology' AS URL,
+                            i.db_schema_object_indexid AS details, 
+                            i.index_definition,
+                            i.secret_columns,
+                            i.index_usage_summary,
+                            ISNULL(sz.index_size_summary,'') AS index_size_summary
+                    FROM    #IndexSanity AS i
+                    JOIN #IndexSanitySize sz ON i.index_sanity_id = sz.index_sanity_id
+                    WHERE i.is_in_memory_oltp = 1
+					AND NOT (@GetAllDatabases = 1 OR @Mode = 0)
+					OPTION    ( RECOMPILE );
 
     END;
 
@@ -4758,6 +4876,7 @@ BEGIN;
 											[is_spatial] BIT, 
 											[is_NC_columnstore] BIT, 
 											[is_CX_columnstore] BIT, 
+											[is_in_memory_oltp] BIT, 
 											[is_disabled] BIT, 
 											[is_hypothetical] BIT, 
 											[is_padded] BIT, 
@@ -4867,6 +4986,7 @@ BEGIN;
 											[is_spatial], 
 											[is_NC_columnstore], 
 											[is_CX_columnstore], 
+                                            [is_in_memory_oltp],
 											[is_disabled], 
 											[is_hypothetical], 
 											[is_padded], 
@@ -4952,6 +5072,7 @@ BEGIN;
 										is_spatial AS [Is Spatial],
 										is_NC_columnstore AS [Is NC Columnstore],
 										is_CX_columnstore AS [Is CX Columnstore],
+										is_in_memory_oltp AS [Is In-Memory OLTP],
 										is_disabled AS [Is Disabled], 
 										is_hypothetical AS [Is Hypothetical],
 										is_padded AS [Is Padded], 
@@ -5044,6 +5165,7 @@ BEGIN;
 					is_spatial AS [Is Spatial],
 					is_NC_columnstore AS [Is NC Columnstore],
 					is_CX_columnstore AS [Is CX Columnstore],
+					is_in_memory_oltp AS [Is In-Memory OLTP],
 					is_disabled AS [Is Disabled], 
 					is_hypothetical AS [Is Hypothetical],
 					is_padded AS [Is Padded], 
@@ -5133,10 +5255,13 @@ BEGIN;
 				mi.avg_user_impact AS [Est Index Improvement], 
 				mi.user_seeks AS [Seeks], 
 				mi.user_scans AS [Scans],
-				mi.unique_compiles AS [Compiles], 
-				mi.equality_columns AS [Equality Columns], 
-				mi.inequality_columns AS [Inequality Columns], 
-				mi.included_columns AS [Included Columns], 
+				mi.unique_compiles AS [Compiles],
+				mi.equality_columns AS [EC],
+				mi.equality_columns_with_data_type AS [Equality Columns],
+				mi.inequality_columns,
+				mi.inequality_columns_with_data_type AS [Inequality Columns],
+				mi.included_columns,
+				mi.included_columns_with_data_type AS [Included Columns], 
 				mi.index_estimated_impact AS [Estimated Impact], 
 				mi.create_tsql AS [Create TSQL], 
 				mi.more_info AS [More Info],
@@ -5148,7 +5273,8 @@ BEGIN;
 			AND mi.database_id = cd.database_id
 			AND mi.schema_name = cd.schema_name
 			/* Minimum benefit threshold = 100k/day of uptime OR since table creation date, whichever is lower*/
-			WHERE (mi.magic_benefit_number / CASE WHEN cd.create_days < @DaysUptime THEN cd.create_days ELSE @DaysUptime END) >= 100000
+			WHERE @ShowAllMissingIndexRequests=1 
+            OR (mi.magic_benefit_number / CASE WHEN cd.create_days < @DaysUptime THEN cd.create_days ELSE @DaysUptime END) >= 100000
 			UNION ALL
 			SELECT               
 				@ScriptVersionName,   
@@ -5157,7 +5283,7 @@ BEGIN;
 				100000000000,
 				@DaysUptimeInsertValue,
 				NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,
-				NULL, 0 AS [Display Order], NULL AS is_low
+				NULL, NULL, NULL, NULL, 0 AS [Display Order], NULL AS is_low
 			ORDER BY [Display Order] ASC, [Magic Benefit Number] DESC
 			OPTION (RECOMPILE);
 	  	END;
