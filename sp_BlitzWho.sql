@@ -29,7 +29,7 @@ BEGIN
 	SET NOCOUNT ON;
 	SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
 	
-	SELECT @Version = '7.99', @VersionDate = '20200913';
+	SELECT @Version = '7.999', @VersionDate = '20201011';
     
 	IF(@VersionCheckMode = 1)
 	BEGIN
@@ -1048,7 +1048,7 @@ SET @StringToExecute +=
 								WHEN @SortOrder = 'request_physical_reads'		THEN 'COALESCE(r.reads, s.reads) DESC '
 								WHEN @SortOrder = 'session_cpu'		THEN 's.cpu_time DESC'
 								WHEN @SortOrder = 'session_logical_reads'		THEN 's.logical_reads DESC'
-								WHEN @SortOrder = 'session_physical_reads'		THEN 's.writes DESC'
+								WHEN @SortOrder = 'session_physical_reads'		THEN 's.reads DESC'
 								WHEN @SortOrder = 'session_writes'		THEN 's.writes DESC'
 								WHEN @SortOrder = 'tempdb_allocations_mb'		THEN '[tempdb_allocations_mb] DESC'
 								WHEN @SortOrder = 'memory_usage'		THEN '[memory_usage] DESC'
